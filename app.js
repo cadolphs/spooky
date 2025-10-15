@@ -298,10 +298,21 @@ async function startWebcam() {
         // Attach stream to video element
         video.srcObject = stream;
 
+        // iOS Safari compatibility: ensure muted and playsinline
+        video.muted = true;
+        video.playsInline = true;
+
         // Wait for video to be ready, then start rendering
-        video.onloadedmetadata = () => {
-            startTime = performance.now();
-            renderFrame();
+        video.onloadedmetadata = async () => {
+            try {
+                // iOS Safari requires explicit play() call
+                await video.play();
+                startTime = performance.now();
+                renderFrame();
+            } catch (playError) {
+                console.error('Error playing video:', playError);
+                status.textContent = 'Error starting video playback.';
+            }
         };
 
         // Update UI
