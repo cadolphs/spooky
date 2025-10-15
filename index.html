@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spooky Mirror</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <h1>Spooky Mirror</h1>
+        <div class="video-container">
+            <video id="webcam" autoplay playsinline></video>
+            <canvas id="canvas"></canvas>
+        </div>
+        <div class="controls">
+            <button id="startBtn">Start Camera</button>
+            <p id="status">Click "Start Camera" to begin</p>
+        </div>
+        <div class="filters">
+            <h2>Filters</h2>
+            <button class="filter-btn" data-filter="none">No Filter</button>
+            <button class="filter-btn" data-filter="grayscale">Grayscale</button>
+            <button class="filter-btn" data-filter="invert">Invert</button>
+            <button class="filter-btn" data-filter="spooky">Spooky</button>
+            <button class="filter-btn" data-filter="haunted">Haunted</button>
+        </div>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
