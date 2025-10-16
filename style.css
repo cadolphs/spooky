@@ -23,9 +23,19 @@ body {
 
 h1 {
     font-size: 3rem;
-    margin-bottom: 2rem;
+    margin-bottom: 1rem;
     color: #ff6b35;
     text-shadow: 2px 2px 4px rgba(0, 0, 0, 0.5);
+}
+
+.privacy-notice {
+    font-size: 0.9rem;
+    color: #aaa;
+    margin-bottom: 1.5rem;
+    padding: 0.5rem 1rem;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
 .video-container {

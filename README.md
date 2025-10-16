@@ -1,12 +1,22 @@
 # spooky
 
-A Halloween-themed webcam mirror web app for kids. If I have time 😅
+A Halloween-themed webcam mirror web app with spooky real-time filters and effects!
 
 ## What it does
 
-Currently: Displays your webcam as a mirror in your browser.
+Transform yourself with real-time spooky filters:
 
-Coming soon: Spooky filters and effects!
+- **Ghost Head** - Ethereal ghost with displaced colored edges and rainbow eye trails using face detection
+- **Haunted** - Inverted grayscale with jittery glowing edges and color-shifting effects
+- **Zombify** - Undead transformation with sickly green skin tones and pulsing decay effects
+- **Spooky** - Classic inverted grayscale for a simple ghostly look
+- **Plus**: Grayscale, Invert, and Face Debug modes
+
+All filters run with real-time face detection powered by TensorFlow.js and MediaPipe FaceMesh!
+
+## Privacy First
+
+**All processing happens 100% client-side in your browser.** Your webcam video never leaves your device - no data is sent to any server. The app works entirely offline once loaded!
 
 ## Quick Start
 
@@ -19,14 +29,19 @@ python3 -m http.server 8000
 
 3. Click "Start Camera" and allow webcam access
 
-That's it!
+4. Choose a filter and get spooked!
 
 ## Tech Stack
 
 - Vanilla HTML/CSS/JavaScript
 - WebRTC API for webcam access
-- No dependencies, no build tools needed
+- TensorFlow.js + MediaPipe FaceMesh for face detection
+- Canvas API for real-time image processing
+- No server-side code, no build tools needed
 
 ## Browser Requirements
 
-Any modern browser (Chrome, Firefox, Safari, Edge) with webcam support.
+Any modern browser (Chrome, Firefox, Safari, Edge) with:
+- Webcam support
+- JavaScript enabled
+- Canvas API support
