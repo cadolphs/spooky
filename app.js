@@ -20,6 +20,568 @@ let frameCount = 0; // For throttling face detection
 let eyePositionHistory = []; // Trail history for swirl effect
 const MAX_EYE_HISTORY = 12; // Number of trail positions to keep
 
+// WebGL state
+let gl = null;
+let edgeDetectionProgram = null;
+let jitterProgram = null;
+let blurProgram = null;
+let compositeProgram = null;
+let videoTexture = null;
+let edgeTexture = null;
+let jitteredEdgeTexture = null;
+let blurredEdgeTexture = null;
+let framebuffer = null;
+let framebuffer2 = null;
+let framebuffer3 = null;
+let positionBuffer = null;
+let texCoordBuffer = null;
+
+// ============================================================================
+// WEBGL INFRASTRUCTURE
+// ============================================================================
+
+/**
+ * Initialize WebGL context and shaders
+ */
+function initWebGL() {
+    // Get WebGL context from canvas
+    gl = canvas.getContext('webgl', {
+        premultipliedAlpha: false,
+        preserveDrawingBuffer: true
+    });
+
+    if (!gl) {
+        console.error('WebGL not supported');
+        return false;
+    }
+
+    console.log('✓ WebGL context created');
+
+    // Vertex shader - simple full-screen quad
+    const vertexShaderSource = `
+        attribute vec2 a_position;
+        attribute vec2 a_texCoord;
+        varying vec2 v_texCoord;
+
+        void main() {
+            gl_Position = vec4(a_position, 0.0, 1.0);
+            v_texCoord = a_texCoord;
+        }
+    `;
+
+    // Fragment shader for edge detection (Laplace kernel)
+    const edgeDetectionFragmentSource = `
+        precision mediump float;
+        uniform sampler2D u_image;
+        uniform vec2 u_textureSize;
+        varying vec2 v_texCoord;
+
+        void main() {
+            vec2 onePixel = 1.0 / u_textureSize;
+
+            // Laplace kernel (3x3)
+            vec4 sum = vec4(0.0);
+            sum += texture2D(u_image, v_texCoord + vec2(-onePixel.x, -onePixel.y)) * 1.0;
+            sum += texture2D(u_image, v_texCoord + vec2(0.0, -onePixel.y)) * 1.0;
+            sum += texture2D(u_image, v_texCoord + vec2(onePixel.x, -onePixel.y)) * 1.0;
+            sum += texture2D(u_image, v_texCoord + vec2(-onePixel.x, 0.0)) * 1.0;
+            sum += texture2D(u_image, v_texCoord) * -8.0;
+            sum += texture2D(u_image, v_texCoord + vec2(onePixel.x, 0.0)) * 1.0;
+            sum += texture2D(u_image, v_texCoord + vec2(-onePixel.x, onePixel.y)) * 1.0;
+            sum += texture2D(u_image, v_texCoord + vec2(0.0, onePixel.y)) * 1.0;
+            sum += texture2D(u_image, v_texCoord + vec2(onePixel.x, onePixel.y)) * 1.0;
+
+            gl_FragColor = vec4(abs(sum.rgb), 1.0);
+        }
+    `;
+
+    // Fragment shader for jitter (like addJitter in Haunted filter)
+    const jitterFragmentSource = `
+        precision mediump float;
+        uniform sampler2D u_image;
+        uniform vec2 u_textureSize;
+        uniform float u_time;
+        varying vec2 v_texCoord;
+
+        // Noise function
+        float noise(vec2 co) {
+            return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        }
+
+        void main() {
+            vec2 onePixel = 1.0 / u_textureSize;
+            vec2 pixelCoord = v_texCoord * u_textureSize;
+
+            // Random offset based on pixel position and time (intensity = 3 pixels like Haunted)
+            float offsetX = (noise(pixelCoord * 0.1 + u_time * 10.0) - 0.5) * 2.0 * 3.0;
+            float offsetY = (noise(pixelCoord * 0.1 + u_time * 10.0 + 100.0) - 0.5) * 2.0 * 3.0;
+
+            vec2 sourceCoord = (pixelCoord + vec2(offsetX, offsetY)) / u_textureSize;
+
+            // Clamp to texture bounds
+            sourceCoord = clamp(sourceCoord, vec2(0.0), vec2(1.0));
+
+            gl_FragColor = texture2D(u_image, sourceCoord);
+        }
+    `;
+
+    // Fragment shader for Gaussian blur (thicker edges - 20 pixel radius)
+    const blurFragmentSource = `
+        precision mediump float;
+        uniform sampler2D u_image;
+        uniform vec2 u_textureSize;
+        uniform vec2 u_direction;
+        varying vec2 v_texCoord;
+
+        void main() {
+            vec2 onePixel = 1.0 / u_textureSize;
+
+            // 9-tap Gaussian blur kernel with 20 pixel radius for thicker edges
+            // Weights: [0.05, 0.09, 0.12, 0.15, 0.16, 0.15, 0.12, 0.09, 0.05]
+            vec4 sum = vec4(0.0);
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * -10.0) * 0.05;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * -7.5) * 0.09;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * -5.0) * 0.12;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * -2.5) * 0.15;
+            sum += texture2D(u_image, v_texCoord) * 0.16;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * 2.5) * 0.15;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * 5.0) * 0.12;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * 7.5) * 0.09;
+            sum += texture2D(u_image, v_texCoord + u_direction * onePixel * 10.0) * 0.05;
+
+            gl_FragColor = sum;
+        }
+    `;
+
+    // Fragment shader for final composite (grayscale + invert + morphing colored edge glow)
+    const compositeFragmentSource = `
+        precision mediump float;
+        uniform sampler2D u_image;
+        uniform sampler2D u_edges;
+        uniform float u_time;
+        uniform vec2 u_textureSize;
+        varying vec2 v_texCoord;
+
+        // Noise function for jitter
+        float noise(vec2 co) {
+            return fract(sin(dot(co.xy, vec2(12.9898, 78.233))) * 43758.5453);
+        }
+
+        void main() {
+            vec4 color = texture2D(u_image, v_texCoord);
+
+            // Apply jitter when sampling edges (AFTER blur, so blur doesn't smooth it out)
+            vec2 pixelCoord = v_texCoord * u_textureSize;
+            vec2 onePixel = 1.0 / u_textureSize;
+            float offsetX = (noise(pixelCoord * 0.1 + u_time * 10.0) - 0.5) * 2.0 * 3.0;
+            float offsetY = (noise(pixelCoord * 0.1 + u_time * 10.0 + 100.0) - 0.5) * 2.0 * 3.0;
+            vec2 jitteredCoord = v_texCoord + vec2(offsetX, offsetY) * onePixel;
+
+            vec4 edge = texture2D(u_edges, jitteredCoord);
+
+            // Convert to grayscale
+            float gray = 0.299 * color.r + 0.587 * color.g + 0.114 * color.b;
+
+            // Invert for ghostly effect
+            float inverted = 1.0 - gray;
+            vec3 result = vec3(inverted);
+
+            // Time-based color drift (multiple sine waves for organic morphing) - MUCH MORE COLORFUL
+            float redDrift = sin(u_time * 0.3) * 0.5;
+            float greenDrift = sin(u_time * 0.23 + 1.5) * 0.6;
+            float blueDrift = sin(u_time * 0.17 + 3.0) * 0.7;
+
+            // Add spatial variation for more interesting colors
+            float spatialVar = sin(v_texCoord.x * 3.14159 * 2.0 + u_time * 0.5) *
+                              cos(v_texCoord.y * 3.14159 * 2.0 + u_time * 0.3);
+
+            // Add glowing blurred edge overlay with morphing colors
+            float edgeIntensity = max(edge.r, max(edge.g, edge.b));
+            float threshold = 5.0 / 255.0; // Lower threshold for thicker edges
+
+            if (edgeIntensity > threshold) {
+                float glowStrength = min(edgeIntensity * 2.0, 1.0); // Amplify even more
+
+                // Morphing rainbow edge glow
+                result.r = min(1.0, result.r + glowStrength * (0.3 + redDrift + spatialVar * 0.3));
+                result.g = min(1.0, result.g + glowStrength * (0.5 + greenDrift + spatialVar * 0.4));
+                result.b = min(1.0, result.b + glowStrength * (0.8 + blueDrift + spatialVar * 0.5));
+            } else {
+                // Subtle drift on base image too
+                result.r = clamp(result.r + redDrift * 0.1, 0.0, 1.0);
+                result.g = clamp(result.g + greenDrift * 0.1, 0.0, 1.0);
+                result.b = clamp(result.b + blueDrift * 0.1, 0.0, 1.0);
+            }
+
+            gl_FragColor = vec4(result, 1.0);
+        }
+    `;
+
+    // Compile shaders and create programs
+    edgeDetectionProgram = createProgram(gl, vertexShaderSource, edgeDetectionFragmentSource);
+    jitterProgram = createProgram(gl, vertexShaderSource, jitterFragmentSource);
+    blurProgram = createProgram(gl, vertexShaderSource, blurFragmentSource);
+    compositeProgram = createProgram(gl, vertexShaderSource, compositeFragmentSource);
+
+    if (!edgeDetectionProgram || !jitterProgram || !blurProgram || !compositeProgram) {
+        console.error('Failed to create shader programs');
+        return false;
+    }
+
+    // Create buffers for full-screen quad
+    positionBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        -1, -1,
+         1, -1,
+        -1,  1,
+        -1,  1,
+         1, -1,
+         1,  1
+    ]), gl.STATIC_DRAW);
+
+    texCoordBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+        0, 1,
+        1, 1,
+        0, 0,
+        0, 0,
+        1, 1,
+        1, 0
+    ]), gl.STATIC_DRAW);
+
+    // Create textures
+    videoTexture = gl.createTexture();
+    edgeTexture = gl.createTexture();
+    jitteredEdgeTexture = gl.createTexture();
+    blurredEdgeTexture = gl.createTexture();
+
+    // Set up edge texture
+    gl.bindTexture(gl.TEXTURE_2D, edgeTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    // Set up jittered edge texture
+    gl.bindTexture(gl.TEXTURE_2D, jitteredEdgeTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    // Set up blurred edge texture
+    gl.bindTexture(gl.TEXTURE_2D, blurredEdgeTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+    // Create framebuffers for multi-pass rendering
+    framebuffer = gl.createFramebuffer();
+    framebuffer2 = gl.createFramebuffer();
+    framebuffer3 = gl.createFramebuffer();
+
+    console.log('✓ WebGL shaders and buffers initialized');
+    return true;
+}
+
+/**
+ * Helper: Compile shader
+ */
+function compileShader(gl, source, type) {
+    const shader = gl.createShader(type);
+    gl.shaderSource(shader, source);
+    gl.compileShader(shader);
+
+    if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Shader compilation error:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+    }
+
+    return shader;
+}
+
+/**
+ * Helper: Create shader program
+ */
+function createProgram(gl, vertexSource, fragmentSource) {
+    const vertexShader = compileShader(gl, vertexSource, gl.VERTEX_SHADER);
+    const fragmentShader = compileShader(gl, fragmentSource, gl.FRAGMENT_SHADER);
+
+    if (!vertexShader || !fragmentShader) {
+        return null;
+    }
+
+    const program = gl.createProgram();
+    gl.attachShader(program, vertexShader);
+    gl.attachShader(program, fragmentShader);
+    gl.linkProgram(program);
+
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        console.error('Program linking error:', gl.getProgramInfoLog(program));
+        gl.deleteProgram(program);
+        return null;
+    }
+
+    return program;
+}
+
+/**
+ * Render Ghost Head filter using WebGL (GPU-accelerated)
+ */
+function renderGhostHeadWebGL() {
+    if (!gl || !edgeDetectionProgram || !jitterProgram || !blurProgram || !compositeProgram) {
+        console.error('WebGL not initialized');
+        return;
+    }
+
+    const width = canvas.width;
+    const height = canvas.height;
+
+    // Update video texture with current canvas content
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+
+    // Set up texture sizes
+    gl.bindTexture(gl.TEXTURE_2D, edgeTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.bindTexture(gl.TEXTURE_2D, jitteredEdgeTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    gl.bindTexture(gl.TEXTURE_2D, blurredEdgeTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+
+    const elapsed = (performance.now() - startTime) / 1000.0;
+
+    // PASS 1: Edge detection
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, edgeTexture, 0);
+    gl.viewport(0, 0, width, height);
+
+    gl.useProgram(edgeDetectionProgram);
+
+    const edgePosLoc = gl.getAttribLocation(edgeDetectionProgram, 'a_position');
+    const edgeTexLoc = gl.getAttribLocation(edgeDetectionProgram, 'a_texCoord');
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.enableVertexAttribArray(edgePosLoc);
+    gl.vertexAttribPointer(edgePosLoc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.enableVertexAttribArray(edgeTexLoc);
+    gl.vertexAttribPointer(edgeTexLoc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.uniform1i(gl.getUniformLocation(edgeDetectionProgram, 'u_image'), 0);
+    gl.uniform2f(gl.getUniformLocation(edgeDetectionProgram, 'u_textureSize'), width, height);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // PASS 2: Jitter the edge pixels (distort the edges themselves)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer2);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, jitteredEdgeTexture, 0);
+    gl.viewport(0, 0, width, height);
+
+    gl.useProgram(jitterProgram);
+
+    const jitterPosLoc = gl.getAttribLocation(jitterProgram, 'a_position');
+    const jitterTexLoc = gl.getAttribLocation(jitterProgram, 'a_texCoord');
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.enableVertexAttribArray(jitterPosLoc);
+    gl.vertexAttribPointer(jitterPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.enableVertexAttribArray(jitterTexLoc);
+    gl.vertexAttribPointer(jitterTexLoc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, edgeTexture);
+    gl.uniform1i(gl.getUniformLocation(jitterProgram, 'u_image'), 0);
+    gl.uniform2f(gl.getUniformLocation(jitterProgram, 'u_textureSize'), width, height);
+    gl.uniform1f(gl.getUniformLocation(jitterProgram, 'u_time'), elapsed);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // PASS 3: Horizontal blur (on jittered edges)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer3);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, blurredEdgeTexture, 0);
+    gl.viewport(0, 0, width, height);
+
+    gl.useProgram(blurProgram);
+
+    const blurPosLoc1 = gl.getAttribLocation(blurProgram, 'a_position');
+    const blurTexLoc1 = gl.getAttribLocation(blurProgram, 'a_texCoord');
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.enableVertexAttribArray(blurPosLoc1);
+    gl.vertexAttribPointer(blurPosLoc1, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.enableVertexAttribArray(blurTexLoc1);
+    gl.vertexAttribPointer(blurTexLoc1, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, jitteredEdgeTexture);
+    gl.uniform1i(gl.getUniformLocation(blurProgram, 'u_image'), 0);
+    gl.uniform2f(gl.getUniformLocation(blurProgram, 'u_textureSize'), width, height);
+    gl.uniform2f(gl.getUniformLocation(blurProgram, 'u_direction'), 1.0, 0.0); // Horizontal
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // PASS 4: Vertical blur
+    gl.bindFramebuffer(gl.FRAMEBUFFER, framebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, edgeTexture, 0);
+    gl.viewport(0, 0, width, height);
+
+    gl.useProgram(blurProgram);
+
+    const blurPosLoc2 = gl.getAttribLocation(blurProgram, 'a_position');
+    const blurTexLoc2 = gl.getAttribLocation(blurProgram, 'a_texCoord');
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.enableVertexAttribArray(blurPosLoc2);
+    gl.vertexAttribPointer(blurPosLoc2, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.enableVertexAttribArray(blurTexLoc2);
+    gl.vertexAttribPointer(blurTexLoc2, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, blurredEdgeTexture);
+    gl.uniform1i(gl.getUniformLocation(blurProgram, 'u_image'), 0);
+    gl.uniform2f(gl.getUniformLocation(blurProgram, 'u_textureSize'), width, height);
+    gl.uniform2f(gl.getUniformLocation(blurProgram, 'u_direction'), 0.0, 1.0); // Vertical
+
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // PASS 5: Composite (grayscale + invert + jittered blurred edge glow with morphing colors)
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.viewport(0, 0, width, height);
+
+    gl.useProgram(compositeProgram);
+
+    // Set up attributes
+    const compPosLoc = gl.getAttribLocation(compositeProgram, 'a_position');
+    const compTexLoc = gl.getAttribLocation(compositeProgram, 'a_texCoord');
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
+    gl.enableVertexAttribArray(compPosLoc);
+    gl.vertexAttribPointer(compPosLoc, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, texCoordBuffer);
+    gl.enableVertexAttribArray(compTexLoc);
+    gl.vertexAttribPointer(compTexLoc, 2, gl.FLOAT, false, 0, 0);
+
+    // Set uniforms
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, videoTexture);
+    gl.uniform1i(gl.getUniformLocation(compositeProgram, 'u_image'), 0);
+
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, edgeTexture); // Now contains blurred edges
+    gl.uniform1i(gl.getUniformLocation(compositeProgram, 'u_edges'), 1);
+
+    // Pass time for color morphing and texture size for jitter
+    gl.uniform1f(gl.getUniformLocation(compositeProgram, 'u_time'), elapsed);
+    gl.uniform2f(gl.getUniformLocation(compositeProgram, 'u_textureSize'), width, height);
+
+    // Draw
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+    // Now read back to 2D context for eye trail rendering
+    const imageData = ctx.getImageData(0, 0, width, height);
+
+    // Draw rainbow eye trails (same as CPU version)
+    if (eyePositionHistory.length > 0) {
+        const data = imageData.data;
+        const currentTime = performance.now();
+
+        eyePositionHistory.forEach((historyItem, index) => {
+            const ageRatio = index / eyePositionHistory.length;
+            const opacity = ageRatio;
+            const radius = 25 + (10 * ageRatio);
+            const spiralOffset = (1 - ageRatio) * 10;
+            const spiralAngle = ageRatio * Math.PI * 2;
+
+            [historyItem.left, historyItem.right].forEach(eye => {
+                const eyeX = eye.x + Math.cos(spiralAngle) * spiralOffset;
+                const eyeY = eye.y + Math.sin(spiralAngle) * spiralOffset;
+
+                for (let dy = -radius; dy <= radius; dy++) {
+                    for (let dx = -radius; dx <= radius; dx++) {
+                        const dist = Math.sqrt(dx * dx + dy * dy);
+                        if (dist <= radius) {
+                            const px = Math.floor(eyeX + dx);
+                            const py = Math.floor(eyeY + dy);
+                            if (px >= 0 && px < width && py >= 0 && py < height) {
+                                const idx = (py * width + px) * 4;
+                                const glowStrength = Math.pow(1 - (dist / radius), 2) * opacity;
+
+                                const currentR = data[idx];
+                                const currentG = data[idx + 1];
+                                const currentB = data[idx + 2];
+
+                                // Rainbow color calculation
+                                const hue = ageRatio;
+                                let r, g, b;
+
+                                if (hue < 0.17) {
+                                    const t = hue / 0.17;
+                                    r = 255 * (1 - t);
+                                    g = 0;
+                                    b = 255;
+                                } else if (hue < 0.34) {
+                                    const t = (hue - 0.17) / 0.17;
+                                    r = 0;
+                                    g = 255 * t;
+                                    b = 255;
+                                } else if (hue < 0.5) {
+                                    const t = (hue - 0.34) / 0.16;
+                                    r = 0;
+                                    g = 255;
+                                    b = 255 * (1 - t);
+                                } else if (hue < 0.67) {
+                                    const t = (hue - 0.5) / 0.17;
+                                    r = 255 * t;
+                                    g = 255;
+                                    b = 0;
+                                } else if (hue < 0.84) {
+                                    const t = (hue - 0.67) / 0.17;
+                                    r = 255;
+                                    g = 255 * (1 - t * 0.5);
+                                    b = 0;
+                                } else {
+                                    const t = (hue - 0.84) / 0.16;
+                                    r = 255;
+                                    g = 128 * (1 - t);
+                                    b = 0;
+                                }
+
+                                data[idx] = Math.min(255, currentR + glowStrength * r);
+                                data[idx + 1] = Math.min(255, currentG + glowStrength * g);
+                                data[idx + 2] = Math.min(255, currentB + glowStrength * b);
+                            }
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    // Put the modified image data back to canvas
+    ctx.putImageData(imageData, 0, 0);
+}
+
 // ============================================================================
 // FACE DETECTION
 // ============================================================================
@@ -461,15 +1023,15 @@ const Filters = {
     },
 
     /**
-     * Ghost Head filter - Ethereal ghost with swirly trailing eyes
-     * Grayscale + edge glow + rainbow eye trails
+     * Ghost Head filter - Ethereal ghost with swirly trailing eyes + spectral echo edges
+     * Grayscale + inversion + displaced colored edges + rainbow eye trails
      */
     ghostHead: (imageData) => {
         const width = imageData.width;
         const height = imageData.height;
         const data = imageData.data;
 
-        // Step 1: Detect edges using Laplace kernel (like Haunted filter)
+        // Step 1: Detect edges on original image (before grayscale)
         const edgeData = new ImageData(
             new Uint8ClampedArray(imageData.data),
             width,
@@ -486,7 +1048,7 @@ const Filters = {
         applyConvolution(edgeData, laplaceKernel);
         const edges = edgeData.data;
 
-        // Step 2: Convert to grayscale and invert (like Spooky filter)
+        // Step 2: Convert base image to grayscale and invert (ghostly base)
         for (let i = 0; i < data.length; i += 4) {
             const r = data[i];
             const g = data[i + 1];
@@ -503,24 +1065,90 @@ const Filters = {
             data[i + 2] = inverted;
         }
 
-        // Step 3: Add glowing edge overlay on top
-        for (let i = 0; i < data.length; i += 4) {
-            // Get edge intensity (use max of RGB from edge detection)
-            const edgeIntensity = Math.max(edges[i], edges[i + 1], edges[i + 2]);
+        // Step 3: Draw spectral echo - displaced colored edges
+        const elapsed = (performance.now() - startTime) / 1000;
 
-            // Lower threshold to show more edges
-            const threshold = 15;
+        // Time-varying displacement
+        const offsetX = Math.sin(elapsed * 0.5) * 8; // Oscillates -8 to +8 pixels
+        const offsetY = Math.cos(elapsed * 0.3) * 8;
 
-            if (edgeIntensity > threshold) {
-                // Add bright cyan/white glow to edges
-                const glowStrength = Math.min(edgeIntensity / 255, 1.0);
-                data[i] = Math.min(255, data[i] + glowStrength * 150);       // R
-                data[i + 1] = Math.min(255, data[i + 1] + glowStrength * 200); // G
-                data[i + 2] = Math.min(255, data[i + 2] + glowStrength * 255); // B
+        // Time-varying color (cycling through spectrum SLOWLY)
+        const hueShift = (elapsed * 0.05) % 1.0; // 0 to 1, cycles every 20 seconds (much slower)
+        let echoR, echoG, echoB;
+
+        // Convert hue to RGB (simple HSV to RGB for hue only, max saturation and value)
+        if (hueShift < 0.17) { // Purple to Blue
+            const t = hueShift / 0.17;
+            echoR = 255 * (1 - t);
+            echoG = 0;
+            echoB = 255;
+        } else if (hueShift < 0.34) { // Blue to Cyan
+            const t = (hueShift - 0.17) / 0.17;
+            echoR = 0;
+            echoG = 255 * t;
+            echoB = 255;
+        } else if (hueShift < 0.5) { // Cyan to Green
+            const t = (hueShift - 0.34) / 0.16;
+            echoR = 0;
+            echoG = 255;
+            echoB = 255 * (1 - t);
+        } else if (hueShift < 0.67) { // Green to Yellow
+            const t = (hueShift - 0.5) / 0.17;
+            echoR = 255 * t;
+            echoG = 255;
+            echoB = 0;
+        } else if (hueShift < 0.84) { // Yellow to Orange
+            const t = (hueShift - 0.67) / 0.17;
+            echoR = 255;
+            echoG = 255 * (1 - t * 0.5);
+            echoB = 0;
+        } else { // Orange to Red to Purple
+            const t = (hueShift - 0.84) / 0.16;
+            echoR = 255;
+            echoG = 128 * (1 - t);
+            echoB = 255 * t;
+        }
+
+        // Draw displaced edges with color - THICKER edges
+        const threshold = 30;
+        const edgeThickness = 3; // Draw edges in a 3-pixel radius for thickness
+
+        for (let y = 0; y < height; y++) {
+            for (let x = 0; x < width; x++) {
+                const idx = (y * width + x) * 4;
+                const edgeIntensity = Math.max(edges[idx], edges[idx + 1], edges[idx + 2]);
+
+                if (edgeIntensity > threshold) {
+                    // Calculate displaced position
+                    const centerX = Math.floor(x + offsetX);
+                    const centerY = Math.floor(y + offsetY);
+
+                    // Draw in a radius to make edges thicker
+                    for (let dy = -edgeThickness; dy <= edgeThickness; dy++) {
+                        for (let dx = -edgeThickness; dx <= edgeThickness; dx++) {
+                            const dist = Math.sqrt(dx * dx + dy * dy);
+                            if (dist <= edgeThickness) {
+                                const newX = centerX + dx;
+                                const newY = centerY + dy;
+
+                                // Check bounds
+                                if (newX >= 0 && newX < width && newY >= 0 && newY < height) {
+                                    const newIdx = (newY * width + newX) * 4;
+                                    const intensity = (edgeIntensity / 255) * (1 - dist / edgeThickness); // Fade with distance
+
+                                    // Blend the colored edge onto the grayscale image
+                                    data[newIdx] = Math.min(255, data[newIdx] + echoR * intensity * 0.8);
+                                    data[newIdx + 1] = Math.min(255, data[newIdx + 1] + echoG * intensity * 0.8);
+                                    data[newIdx + 2] = Math.min(255, data[newIdx + 2] + echoB * intensity * 0.8);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
-        // Draw trailing swirly eyes from history
+        // Step 4: Draw trailing swirly rainbow eyes from history
         if (eyePositionHistory.length > 0) {
             const currentTime = performance.now();
 
@@ -728,6 +1356,7 @@ function renderFrame() {
 
     // Apply current filter
     if (currentFilter !== 'none' && Filters[currentFilter]) {
+        // Use CPU version for all filters
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const filteredData = Filters[currentFilter](imageData);
         ctx.putImageData(filteredData, 0, 0);
@@ -770,6 +1399,11 @@ async function startWebcam() {
                 // Initialize face detector
                 if (!faceDetector) {
                     await initFaceDetector();
+                }
+
+                // Initialize WebGL for GPU-accelerated filters
+                if (!gl) {
+                    initWebGL();
                 }
 
                 renderFrame();
