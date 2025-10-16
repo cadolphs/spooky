@@ -20,12 +20,21 @@
         <div class="filters">
             <h2>Filters</h2>
             <button class="filter-btn" data-filter="none">No Filter</button>
+            <button class="filter-btn" data-filter="faceDebug">Face Debug</button>
             <button class="filter-btn" data-filter="grayscale">Grayscale</button>
             <button class="filter-btn" data-filter="invert">Invert</button>
             <button class="filter-btn" data-filter="spooky">Spooky</button>
             <button class="filter-btn" data-filter="haunted">Haunted</button>
+            <button class="filter-btn" data-filter="zombify">Zombify</button>
+            <button class="filter-btn" data-filter="ghostHead">Ghost Head</button>
         </div>
     </div>
+    <!-- TensorFlow.js and Face Detection -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-core"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-converter"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-webgl"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/face-landmarks-detection"></script>
     <script src="app.js"></script>
 </body>
 </html>
